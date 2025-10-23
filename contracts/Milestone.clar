@@ -57,6 +57,14 @@
 
 (define-map milestone-completions uint uint)
 
+(define-map course-leaderboard {course-id: uint, student: principal} {
+    course-points: uint,
+    course-milestones: uint,
+    last-updated: uint
+})
+
+(define-map course-top-students uint (list 10 principal))
+
 (define-read-only (get-contract-owner)
     CONTRACT_OWNER
 )
@@ -118,6 +126,122 @@
 
 (define-read-only (get-next-course-id)
     (var-get next-course-id)
+)
+
+(define-read-only (get-course-leaderboard-entry (course-id uint) (student principal))
+    (map-get? course-leaderboard {course-id: course-id, student: student})
+)
+
+(define-read-only (get-student-course-rank (course-id uint) (student principal))
+    (match (get-course-leaderboard-entry course-id student)
+        student-data
+        (let
+            (
+                (student-points (get course-points student-data))
+                (top-students (default-to (list) (map-get? course-top-students course-id)))
+            )
+            (ok {
+                rank: (+ u1 (len (filter is-higher-ranked top-students))),
+                points: student-points,
+                milestones: (get course-milestones student-data)
+            })
+        )
+        ERR_NOT_FOUND
+    )
+)
+
+(define-read-only (get-course-top-performers (course-id uint))
+    (default-to (list) (map-get? course-top-students course-id))
+)
+
+(define-private (is-higher-ranked (other-student principal))
+    (> (default-to u0 (get course-points (get-course-leaderboard-entry u0 other-student))) u0)
+)
+
+(define-private (update-course-leaderboard (student principal) (course-id uint) (points uint) (current-height uint))
+    (let
+        (
+            (current-entry (default-to {course-points: u0, course-milestones: u0, last-updated: u0}
+                (get-course-leaderboard-entry course-id student)))
+            (new-points (+ (get course-points current-entry) points))
+            (new-milestones (+ (get course-milestones current-entry) u1))
+        )
+        (map-set course-leaderboard {course-id: course-id, student: student} {
+            course-points: new-points,
+            course-milestones: new-milestones,
+            last-updated: current-height
+        })
+        (update-top-students course-id student new-points)
+    )
+)
+
+(define-private (update-top-students (course-id uint) (student principal) (student-points uint))
+    (let
+        (
+            (current-top (default-to (list) (map-get? course-top-students course-id)))
+        )
+        (if (or (< (len current-top) u10) (should-be-in-top student student-points current-top))
+            (map-set course-top-students course-id (add-to-top-list student current-top student-points))
+            true
+        )
+    )
+)
+
+(define-private (should-be-in-top (student principal) (points uint) (top-list (list 10 principal)))
+    (if (< (len top-list) u10)
+        true
+        (let
+            (
+                (lowest-in-top (get-lowest-points-in-list top-list))
+            )
+            (> points lowest-in-top)
+        )
+    )
+)
+
+(define-private (get-lowest-points-in-list (top-list (list 10 principal)))
+    (fold min-points-reducer top-list u999999999)
+)
+
+(define-private (min-points-reducer (student principal) (current-min uint))
+    (let
+        (
+            (student-entry (get-course-leaderboard-entry u0 student))
+        )
+        (match student-entry
+            entry (let ((pts (get course-points entry))) (if (< pts current-min) pts current-min))
+            current-min
+        )
+    )
+)
+
+(define-private (add-to-top-list (student principal) (current-list (list 10 principal)) (points uint))
+    (let
+        (
+            (filtered-list (filter not-this-student current-list))
+            (new-list (unwrap-panic (as-max-len? (append filtered-list student) u10)))
+        )
+        (if (<= (len new-list) u10)
+            new-list
+            (take-top-10 new-list)
+        )
+    )
+)
+
+(define-private (not-this-student (other principal))
+    (not (is-eq other tx-sender))
+)
+
+(define-private (take-top-10 (full-list (list 10 principal)))
+    (let
+        (
+            (list-length (len full-list))
+        )
+        (if (> list-length u10)
+            (unwrap-panic (as-max-len? (list) u10))
+            full-list
+        )
+    )
 )
 
 (define-public (add-instructor (new-instructor principal))
@@ -249,12 +373,14 @@
                     (
                         (current-progress (get-student-progress student))
                         (milestone-points (get points milestone-data))
+                        (course-id (get course-id milestone-data))
                     )
                     (map-set student-progress student (merge current-progress {
                         total-points: (+ (get total-points current-progress) milestone-points),
                         milestones-completed: (+ (get milestones-completed current-progress) u1),
                         last-activity: current-height
                     }))
+                    (update-course-leaderboard student course-id milestone-points current-height)
                 )
                 (ok true)
             )
